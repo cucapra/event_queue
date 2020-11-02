@@ -103,23 +103,32 @@ void emitTraceEvent(std::ostream &s,
   s << "},\n";
 }
 
-
-xilinx::equeue::MemAllocOp getAllocOp(Value memRef){
-  return valueIds[memRef].getDefiningOp<xilinx::equeue::MemAllocOp>();
+Value getAllocDevice(Value memRef){
+  auto op = valueIds[memRef].getDefiningOp();
+  if( mlir::dyn_cast<mlir::linalg::ReshapeOp>(op) ||
+      mlir::dyn_cast<mlir::SubViewOp>(op)){
+    //llvm::outs()<<op->getOperand(0)<<"\n";
+    return getAllocDevice(op->getOperand(0));
+  }
+  return valueIds[mlir::cast<xilinx::equeue::MemAllocOp>(op).getMemHandler()];
+  
 }
-int getMemVolume(mlir::Value memRef){
-  auto allocOp = getAllocOp(memRef);
+
+
+//shapedValue: memref, vector, rankedTensor
+int getMemVolume(mlir::Value shapedValue){
   int dlines = 1;
-  for (auto s : allocOp.getShape()){
+  for (auto s : shapedValue.getType().cast<ShapedType>().getShape()){
     dlines *= s;
   }
   return dlines;
 }
 
-uint64_t modelOp(const uint64_t &time, OpEntry &c)
+uint64_t modelOp(const uint64_t &time, mlir::Operation *op, std::vector<uint64_t> &mem_tids)//, OpEntry &c)
 {
-  LLVM_DEBUG(llvm::dbgs()<<"[modelOp] start model op: "<<to_string(c.op)<<"\n");
-  mlir::Operation *op = c.op;
+  LLVM_DEBUG(llvm::dbgs()<<"[modelOp] start model op: "<<to_string(op)<<"\n");
+  //mlir::Operation *op = c.op;
+  LLVM_DEBUG(llvm::dbgs()<<"[modelOp] start model op: "<<*op<<"\n");
   uint64_t execution_time = 1;
   if (auto Op = mlir::dyn_cast<xilinx::equeue::CreateMemOp>(op)) {
     auto shape = Op.getShape();
@@ -128,15 +137,17 @@ uint64_t modelOp(const uint64_t &time, OpEntry &c)
       dlines *= s;
     }
     auto dtype = Op.getDataType().str();
+    auto banks = Op.getBank();
     auto key = valueIds[op->getResults()[0]];
     if (Op.getMemType() == "DRAM")
-      deviceMap[key] = std::make_unique<xilinx::equeue::DRAM>(deviceId++, dlines, dtype);
+      deviceMap[key] = std::make_unique<xilinx::equeue::DRAM>(deviceId, banks, dlines, dtype);
     else if (Op.getMemType() == "SRAM")
-      deviceMap[key] = std::make_unique<xilinx::equeue::SRAM>(deviceId++, dlines, dtype);
+      deviceMap[key] = std::make_unique<xilinx::equeue::SRAM>(deviceId, banks, dlines, dtype);
     else if (Op.getMemType() == "RegisterFile")
-      deviceMap[key] = std::make_unique<xilinx::equeue::RegisterFile>(deviceId++, dlines, dtype);
+      deviceMap[key] = std::make_unique<xilinx::equeue::RegisterFile>(deviceId, banks, dlines, dtype);
     else
       llvm_unreachable("No such memory type.\n");
+    deviceId++;
   }
   else if (auto Op = mlir::dyn_cast<xilinx::equeue::CreateDMAOp>(op)) {
     auto key = valueIds[op->getResults()[0]];
@@ -144,49 +155,100 @@ uint64_t modelOp(const uint64_t &time, OpEntry &c)
   }
   else if (auto Op = mlir::dyn_cast<xilinx::equeue::MemReadOp>(op)) {
     int dlines = Op.hasOffset() ? 1 : getMemVolume( Op.getBuffer() );
-    auto key = valueIds[getAllocOp(Op.getBuffer()).getMemHandler()];
+    auto key = getAllocDevice(Op.getBuffer());
     auto mem = static_cast<xilinx::equeue::Memory *>(deviceMap[key].get());
-    c.mem_tids.push_back(mem->uid);
-    execution_time = mem->getReadOrWriteCycles(dlines, xilinx::equeue::MemOp::Read);
-    return mem->scheduleEvent(time, execution_time, true);
+    mem_tids.push_back(mem->uid);
+    execution_time = mem->getReadOrWriteCycles(dlines,  xilinx::equeue::MemOp::Read);
+    int idx = Op.getBank();
+    return mem->scheduleEvent(idx, time, execution_time, true);
   }
   else if (auto Op = mlir::dyn_cast<xilinx::equeue::MemWriteOp>(op)) {
     int dlines = getMemVolume( Op.getBuffer() );
-    auto key = valueIds[getAllocOp(Op.getBuffer()).getMemHandler()];
+    auto key = getAllocDevice(Op.getBuffer());
     auto mem = static_cast<xilinx::equeue::Memory *>(deviceMap[key].get());
-    c.mem_tids.push_back(mem->uid);
+    mem_tids.push_back(mem->uid);
     execution_time = mem->getReadOrWriteCycles(dlines, xilinx::equeue::MemOp::Write);
-    return mem->scheduleEvent(time, execution_time, true);
+    int idx = Op.getBank();
+    return mem->scheduleEvent(idx, time, execution_time, true);
   }
   else if (auto Op = mlir::dyn_cast<xilinx::equeue::MemCopyOp>(op)) {
-    //TODO: calculate offset
-    int srcLines = getMemVolume( Op.getSrcBuffer() );
-    int destLines = getMemVolume( Op.getDestBuffer() );
+    LLVM_DEBUG(llvm::dbgs()<<"here----"<<"\n");
+    int srcLines = 1;
+    int destLines = 1;
+    if(!Op.hasOffset()){
+      srcLines = getMemVolume( Op.getSrcBuffer() );
+      destLines = getMemVolume( Op.getDestBuffer() );
+    }
     int dlines = std::min(srcLines, destLines);
-    auto srcKey = valueIds[getAllocOp(Op.getSrcBuffer()).getMemHandler()];
-    auto destKey = valueIds[getAllocOp(Op.getDestBuffer()).getMemHandler()];
+    
+    auto srcKey = getAllocDevice(Op.getSrcBuffer());
+    auto destKey = getAllocDevice(Op.getDestBuffer());
+    
     auto srcMem = static_cast<xilinx::equeue::Memory *>(deviceMap[srcKey].get());
-    c.mem_tids.push_back(srcMem->uid);
+    mem_tids.push_back(srcMem->uid);
     uint64_t readTime = srcMem->getReadOrWriteCycles(dlines, xilinx::equeue::MemOp::Read);
+    
     auto destMem = static_cast<xilinx::equeue::Memory *>(deviceMap[destKey].get());
-    c.mem_tids.push_back(destMem->uid);
+    mem_tids.push_back(destMem->uid);
     uint64_t writeTime = destMem->getReadOrWriteCycles(dlines, xilinx::equeue::MemOp::Write);
-    int total_size = srcMem->total_size;
-    int volume = dlines * total_size;
+
+    //int total_size = srcMem->total_size;
+    //int volume = dlines * total_size;
+    int volume = dlines;
     auto key = valueIds[Op.getDMAHandler()];
     auto dma = static_cast<xilinx::equeue::DMA *>(deviceMap[key].get());
     uint64_t dmaTime = dma->getTransferCycles(volume);
-    execution_time = std::max({readTime, writeTime, dmaTime});
+    execution_time = std::max({readTime, writeTime, dmaTime});        
+    LLVM_DEBUG(llvm::dbgs()<<"time----"<<execution_time<<"\n");
     //clean outdated events
-    return dma->scheduleEvent(time, execution_time, {destMem, srcMem});
+    int src_idx = Op.getSrcBank();
+    int dest_idx = Op.getDestBank();
+    return dma->scheduleEvent(0, time, execution_time, {src_idx, dest_idx}, {srcMem, destMem});
+  }
+  else if (auto Op = mlir::dyn_cast<mlir::linalg::GenericOp>(op)) {
+    auto cur_time = time;
+    //TODO: there should be some analysis on common channel, but ignore for now
+    auto total_loop = 1;
+    for(int i = 0; i < Op.getNumInputs(); i++){
+      auto key = getAllocDevice(Op.getInput(i));
+      auto mem = static_cast<xilinx::equeue::Memory *>(deviceMap[key].get());
+      mem_tids.push_back(mem->uid);
+      auto dlines = getMemVolume(Op.getInput(i));
+      total_loop*=dlines;
+      uint64_t readTime = mem->getReadOrWriteCycles(dlines, xilinx::equeue::MemOp::Read);
+      //assuming memory bank is always 0
+      mem->scheduleEvent(0, cur_time, readTime, true);
+      cur_time += readTime;
+    }
+    for(int i = 0; i < Op.getNumOutputs(); i++){
+      auto key = getAllocDevice(Op.getOutputBuffer(i));
+      auto mem = static_cast<xilinx::equeue::Memory *>(deviceMap[key].get());
+      mem_tids.push_back(mem->uid);
+      auto dlines = getMemVolume(Op.getOutputBuffer(i));
+      total_loop*=dlines;
+      uint64_t writeTime = mem->getReadOrWriteCycles(dlines, xilinx::equeue::MemOp::Write);
+      //assuming memory bank is always 0
+      mem->scheduleEvent(0, cur_time, writeTime, true);
+      cur_time += writeTime;
+    }
+    for(auto iter = Op.getBody()->begin(); iter!=Op.getBody()->end(); iter++){
+      auto cur_op = &(*iter);
+      auto new_time = modelOp(cur_time, cur_op, mem_tids);
+      cur_time += (new_time-cur_time)*total_loop;
+    }
+    return cur_time;
   }
   if (  op->hasTrait<mlir::OpTrait::StructureOpTrait>() ||
         mlir::dyn_cast<mlir::ConstantOp>(op) ||
+        mlir::dyn_cast<xilinx::equeue::MemAllocOp>(op) ||
+        mlir::dyn_cast<xilinx::equeue::MemDeallocOp>(op) ||
         mlir::dyn_cast<xilinx::equeue::AwaitOp>(op) ||
         mlir::dyn_cast<xilinx::equeue::LaunchOp>(op) ||
         mlir::dyn_cast<xilinx::equeue::ReturnOp>(op) ||
+        mlir::dyn_cast<mlir::linalg::ReshapeOp>(op) ||
         mlir::dyn_cast<mlir::scf::ForOp>(op) ||
         mlir::dyn_cast<mlir::scf::YieldOp>(op) ||
+        mlir::dyn_cast<mlir::SubViewOp>(op) ||
         mlir::dyn_cast<mlir::ReturnOp>(op) ){
     execution_time = 0;
   }
@@ -220,7 +282,7 @@ void updateSignalIds(mlir::ValueRange args0, mlir::ValueRange args1){
     arg1_it += 1;
   }
 }
-//TODO: illustrate this
+
 void updateIterState(mlir::ValueRange args, bool yield){
   for (Value arg: args ){
     if( arg.getType().isa<xilinx::equeue::EQueueSignalType>() ){
@@ -273,6 +335,11 @@ void finishOp(LauncherTable &l, uint64_t time, uint64_t pid)
           mlir::dyn_cast<xilinx::equeue::CreateDMAOp>(c.op)){
           auto key = c.op->getResult(0);
           LauncherTable l;
+          if( auto dma_op = mlir::dyn_cast<xilinx::equeue::CreateDMAOp>(c.op) ){
+            l.name = dma_op.getName().str();
+          } else if ( auto proc_op = mlir::dyn_cast<xilinx::equeue::CreateProcOp>(c.op)){
+            l.name = proc_op.getName().str();
+          }
           launchTables.insert({key, l});
         }
       }
@@ -282,10 +349,10 @@ void finishOp(LauncherTable &l, uint64_t time, uint64_t pid)
       auto opStr = op_str.substr(position);
       // emit trace event end
       if ( c.end_time != c.start_time ){
-        emitTraceEvent(traceStream, opStr, "operation", "E", time, pid, 0);
+        emitTraceEvent(traceStream, opStr, l.name, "E", time, pid, 0);
       }
       for(auto iter = c.mem_tids.begin(); iter != c.mem_tids.end(); iter++){
-        emitTraceEvent(traceStream, opStr, "memory", "E", time, *iter, 1);
+        emitTraceEvent(traceStream, opStr, l.name, "E", time, *iter, 1);
       }
       // set op_entry to empty
       OpEntry entry;
@@ -314,12 +381,15 @@ void scheduleOp(LauncherTable &l, uint64_t time, uint64_t pid)
     c_next.queue_ready_time = time;
   // emit trace event begin
 
-  if( auto Op = llvm::dyn_cast<xilinx::equeue::AwaitOp>(c_next.op) )
+  if( auto Op = llvm::dyn_cast<xilinx::equeue::AwaitOp>(c_next.op) ){
+  LLVM_DEBUG(llvm::dbgs()<<"[schedule] await op\n");
     if(waitForSignal(c_next.op))
       return;
+  }
   LLVM_DEBUG(llvm::dbgs()<<"[schedule] not waiting for any signal\n");
 
   if ( !c_next.is_started() ){
+    //not scheduled before, let's schedule it
     if( llvm::dyn_cast<xilinx::equeue::LaunchOp>(c_next.op) ||
         llvm::dyn_cast<xilinx::equeue::MemCopyOp>(c_next.op) ||
          llvm::dyn_cast<xilinx::equeue::AwaitOp>(c_next.op) ){
@@ -327,7 +397,7 @@ void scheduleOp(LauncherTable &l, uint64_t time, uint64_t pid)
     }
     LLVM_DEBUG(llvm::dbgs()<<"[schedule] updated execution\n");
     c_next.start_time = time;
-    c_next.end_time = modelOp(time, c_next);
+    c_next.end_time = modelOp(time, c_next.op, c_next.mem_tids);
 
     if (verbose) {
       llvm::outs()<<"scheduled: '";
@@ -339,16 +409,14 @@ void scheduleOp(LauncherTable &l, uint64_t time, uint64_t pid)
     size_t position = op_str.find(op_str);
     auto opStr = op_str.substr(position);
     if ( c_next.end_time != c_next.start_time ){
-      llvm::outs()<<pid<<"\n";
-      
-      emitTraceEvent(traceStream, opStr, "operation", "B", time, pid, 0);
+      emitTraceEvent(traceStream, opStr, l.name, "B", time, pid, 0);
     }
     for(auto iter = c_next.mem_tids.begin(); iter != c_next.mem_tids.end(); iter++){
-      emitTraceEvent(traceStream, opStr, "memory", "B", time, *iter, 1);
+      emitTraceEvent(traceStream, opStr, l.name, "B", time, *iter, 1);
     }
     if (time > c_next.queue_ready_time) {
-      emitTraceEvent(traceStream, "stall", "operation", "B", c_next.queue_ready_time, pid, 0);
-      emitTraceEvent(traceStream, "stall", "operation", "E", time, pid, 0);
+      emitTraceEvent(traceStream, "stall", l.name, "B", c_next.queue_ready_time, pid, 0);
+      emitTraceEvent(traceStream, "stall", l.name, "E", time, pid, 0);
     }
 
   }
@@ -438,30 +506,42 @@ bool waitForSignal(mlir::Operation* op, mlir::Value in){
 
   return false;
 }
-
-void checkEventQueue(LauncherTable& l){
-  while( !l.event_queue.empty() ){
-    auto op = l.event_queue.front();
-
+bool checkControlQueue(){
+  bool generateSignal = false;
+  auto iter = controlQueue.begin();
+  while(iter != controlQueue.end()){
+    auto op = *iter;
     if(op->hasTrait<mlir::OpTrait::ControlOpTrait>()){
-      if( waitForSignal(op) ) return;
-      // the control operation has immediate effect
-      
-      LLVM_DEBUG(llvm::dbgs()<<"[checkEventQueue] finish "<<to_string(op)<<"\n");
+      if( waitForSignal(op) ){
+        iter++;  
+        continue;
+      }
+      //finish control op
+      //immediately udpate signal
+      LLVM_DEBUG(llvm::dbgs()<<"[checkControlQueue] finish "<<to_string(op)<<"\n");
       opMap[op]++;
       updateExecution(op->getResults());
       // first event of event_queue will be handled by launcher
       // continue to check next one
-      l.event_queue.erase(l.event_queue.begin());
+      controlQueue.erase(iter);
+      iter = controlQueue.begin();
+      generateSignal = true;
       continue;
+    }else{
+      llvm_unreachable("check control queue should not sure anything other than control operation.\n");
     }
-    //mlir::Value launcher;
+  }
+  return generateSignal;
+}
+
+void checkEventQueue(LauncherTable& l){
+  if( !l.event_queue.empty() ){
+    //launch op
+    auto op = l.event_queue.front();
     if( auto Op = llvm::dyn_cast<xilinx::equeue::LaunchOp>(op) ){
       if( waitForSignal(op, Op.getStartSignal()) ) return;
-      //launcher = valueIds[Op.getDeviceHandler()];
     } else {//memcopy
       if( waitForSignal(op) ) return;
-      //launcher = valueIds[Op.getDMAHandler()];
     }
     LLVM_DEBUG(llvm::dbgs()<<"[checkEventQueue] "<<to_string(op)<<" finish waiting\n");
     if( l.is_idle() ){
@@ -478,8 +558,8 @@ void checkEventQueue(LauncherTable& l){
       l.event_queue.erase(l.event_queue.begin());
       LLVM_DEBUG(llvm::dbgs()<<"[launchee] erased : "<<l.event_queue.size()<<"\n");
     }
-    break;
   }
+  return ;
 }
 
 void setOpEntry(LauncherTable& l, uint64_t& tid){
@@ -494,10 +574,8 @@ void setOpEntry(LauncherTable& l, uint64_t& tid){
         if(op->hasTrait<mlir::OpTrait::AsyncOpTrait>()){
           // launch, memcpy, control...
           if(op->hasTrait<mlir::OpTrait::ControlOpTrait>()){
-            if (l.add_event_queue(op)){
-              l.next_iter++;
-            }else
-              break;
+            controlQueue.push_back(op);
+            l.next_iter++;
           }else{
             Value launcher;
             if( auto Op = llvm::dyn_cast<xilinx::equeue::LaunchOp>(op) ){
@@ -545,9 +623,10 @@ void nextEndTimes( LauncherTable &l, std::vector<uint64_t> &next_times){
 
 void simulateFunction(mlir::FuncOp &toplevel)
 {
-
+  LLVM_DEBUG(llvm::dbgs()<<"========== start simulation ===========\n");
   auto hostIter = toplevel.getCallableRegion()->front().begin();
   hostTable.host = true;
+  hostTable.name = "host";
   hostTable.next_iter = hostIter;
   hostTable.block = &toplevel.getCallableRegion()->front();
 
@@ -564,15 +643,17 @@ void simulateFunction(mlir::FuncOp &toplevel)
 
     LLVM_DEBUG(llvm::dbgs()<<"2. checkEventQueue\n");
     checkEventQueue(hostTable);
+    checkControlQueue();
     for ( auto iter = launchTables.begin(); iter != launchTables.end(); iter++){
       checkEventQueue(iter->second);
+      if( checkControlQueue() ){
+      //new signal generated, check from the front
+        iter=launchTables.begin();
+      }
     }
     // end condition, nothing can be put on to op_entry
     running = !hostTable.is_idle();
 		for (auto iter = launchTables.begin(); iter!=launchTables.end(); iter++){
-			
-      LLVM_DEBUG(llvm::dbgs()<<iter->first<<"\n");
-      //LLVM_DEBUG(llvm::dbgs()<<iter->second<<"\n");
 			running = running || !iter->second.is_idle();
 		}
     if( !running ) break;
@@ -590,10 +671,12 @@ void simulateFunction(mlir::FuncOp &toplevel)
 		for (auto iter = launchTables.begin(); iter!=launchTables.end(); iter++){
       nextEndTimes(iter->second, next_times);
 		}
-    if(!next_times.size())
+    if(!next_times.size()){
+      LLVM_DEBUG(llvm::dbgs()<<"!!!!!!!!WRONG!!!!!!!!!!\n\n");
       time = time;
-    else
+    } else {
       time =  *std::min_element(next_times.begin(), next_times.end());
+    }
     LLVM_DEBUG(llvm::dbgs()<<"Next end time: "<<time<<"\n");
     //if(time > 2000) break;
     LLVM_DEBUG(llvm::dbgs()<<"4. finishOp\n");
@@ -707,7 +790,8 @@ private:
 
   LauncherTable hostTable;
 	llvm::DenseMap<mlir::Value, LauncherTable > launchTables;
-
+  // store control events, clock-ish
+  std::vector<mlir::Operation *> controlQueue;
   // map operation to (left) execution times
   llvm::DenseMap< mlir::Operation *, uint64_t > exTimes;
   llvm::DenseMap<mlir::Value, mlir::Value> signalIds;
@@ -763,12 +847,12 @@ void CommandProcessor::run(mlir::ModuleOp module) {
 
   for(unsigned i = 0; i < numInputs; i++) {
     mlir::Type type = ftype.getInput(i);
-    if (auto tensorTy = type.dyn_cast<mlir::TensorType>()) {
+    //if (auto tensorTy = type.dyn_cast<mlir::TensorType>()) {
       // We require this memref type to be fully specified.
       // runner.valueMap[blockArgs[i]]++;
-    } else {
-      llvm_unreachable("Only memref arguments are supported.\n");
-    }
+    //} else {
+    //  llvm_unreachable("Only memref arguments are supported.\n");
+    //}
   }
 
   std::vector<llvm::Any> results(numOutputs);
