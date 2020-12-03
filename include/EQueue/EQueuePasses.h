@@ -20,6 +20,7 @@ namespace equeue {
 void registerEQueuePasses();
 void registerTilingPass();
 void registeParallelizePass();
+void registerLoopRemovingPass();
 /// Generate the code for registering passes.
 }
 } // end namespace mlir

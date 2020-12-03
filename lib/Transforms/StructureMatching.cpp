@@ -153,7 +153,7 @@ struct StructureMatchingPass: public PassWrapper<StructureMatchingPass, Function
     (++Region::iterator(split_block))->erase();
     
     final_block->front().moveBefore(&parallelOp->getRegion(0).front(),
-      parallelOp->getRegion(0).front().end());
+    parallelOp->getRegion(0).front().end());
     final_block->erase();
     //OwningRewritePatternList patterns;
     //patterns.insert<ParallelOpConversion>(original_region, context);
