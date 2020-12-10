@@ -56,6 +56,28 @@ using namespace mlir::edsc::intrinsics;
 using namespace mlir::edsc::ops;
 using namespace xilinx::equeue;
 
+
+static mlir::Operation* walkRegions(MutableArrayRef<Region> regions) {
+  llvm::outs() << "hello???" << "\n";
+  for (Region &region : regions){
+   
+    for (Block &block : region) {
+      for (Operation &operation : block){
+        // llvm::outs() << operation << "\n";
+        if (isa<mlir::AffineForOp>(operation)){
+          return &operation;
+        }
+        mlir::Operation* sub_op_res = walkRegions(operation.getRegions());
+         if (sub_op_res != nullptr){
+           return sub_op_res;
+         }
+      }
+    }
+  }
+  return nullptr;
+ }
+
+
 namespace
 {
     // struct ForOpConversion : public OpRewritePattern<mlir::AffineForOp>
@@ -125,33 +147,46 @@ namespace
             auto f = getFunction();
             OpBuilder builder(&getContext());
             std::vector<mlir::AffineForOp> affineFors;
+            MutableArrayRef<Region> regions = f.getRegion();
 
-            //push all the affineFor loops into a vector
-            f.walk([&](mlir::Operation *op) {
-                if (isa<AffineForOp>(op))
-                {
-                    mlir::AffineForOp forop = dyn_cast<mlir::AffineForOp>(op);
-                    affineFors.push_back(forop);
-                }
-            });
-            mlir::AffineForOp op = affineFors[0];
+            auto operation = walkRegions(regions);
+            while (operation != nullptr) {
+            mlir::AffineForOp op = dyn_cast<mlir::AffineForOp>(operation);
+
+            // if condition not met, go into its region
+            bool const_bound = op.hasConstantLowerBound() && op.hasConstantUpperBound();
+            if (!const_bound  || op.getConstantUpperBound() - op.getConstantLowerBound() > op.getStep()){
+                llvm::outs() << "hello" << "\n";
+                operation = walkRegions(operation->getRegions());
+                continue;
+            }    
+            // mlir::AffineForOp op = affineFors[i];
             auto parent = op.getParentOp();
             // auto blk = parent->getRegion(0).front();
-            auto loc = parent->getLoc();
-            Value zero = builder.create<ConstantIndexOp>(loc, 0);
+            ScopedContext scope(builder, parent->getLoc());
+            auto loc = op.getLoc();
+            // Value zero = builder.create<ConstantIndexOp>(loc, 0);
+            builder.setInsertionPointToStart(&op.getRegion().front());
+            Value zero = std_constant_index(0);
+            Value one = std_constant_index(1);
             op.getInductionVar().replaceAllUsesWith(zero);
-
-            for (auto &sub_op : op.getRegion().getOps()){
-                sub_op.moveAfter(op);
-                break;
+            // llvm::outs()<< *parent << "\n";
+            auto counter = 0;
+            builder.setInsertionPoint(op);
+            BlockAndValueMapping map;
+            for (auto &sub_op : op.getRegion().front().without_terminator()){
+                auto cl = builder.clone(sub_op, map);
+                if (sub_op.getNumResults() >= 1 ){
+                     map.map(sub_op.getResults(), cl->getResults());
+                }
+                counter ++;
             }
-    
-
-            llvm::outs()<< "helloooo?" << "\n";
-
+            // op.getRegion().cloneInto()
+            regions = parent->getRegions();
             op.erase();
-            
-
+            operation = walkRegions(regions);
+            llvm::outs()<< *parent << "\n";           
+            }
             // for (int i = 0; i < affineFors.size(); i++)
             // {
             //     // affineFors[i]->getConstantLowerBound();
@@ -173,6 +208,8 @@ namespace
     };
 
 } // namespace
+
+
 
 void equeue::registerLoopRemovingPass()
 {
