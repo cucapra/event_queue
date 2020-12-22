@@ -58,7 +58,6 @@ using namespace xilinx::equeue;
 
 
 static mlir::Operation* walkRegions(MutableArrayRef<Region> regions) {
-  llvm::outs() << "hello???" << "\n";
   for (Region &region : regions){
    
     for (Block &block : region) {
@@ -151,48 +150,93 @@ namespace
 
             auto operation = walkRegions(regions);
             while (operation != nullptr) {
-            mlir::AffineForOp op = dyn_cast<mlir::AffineForOp>(operation);
+                llvm::outs()<< *operation << "\n"; 
+                mlir::AffineForOp op = dyn_cast<mlir::AffineForOp>(operation);
 
-            // if condition not met, go into its region
-            bool const_bound = op.hasConstantLowerBound() && op.hasConstantUpperBound();
-            if (!const_bound  || op.getConstantUpperBound() - op.getConstantLowerBound() > op.getStep()){
-                llvm::outs() << "hello" << "\n";
-                operation = walkRegions(operation->getRegions());
-                continue;
-            }    
-            // mlir::AffineForOp op = affineFors[i];
-            auto parent = op.getParentOp();
-            // auto blk = parent->getRegion(0).front();
-            ScopedContext scope(builder, parent->getLoc());
-            auto loc = op.getLoc();
-            // Value zero = builder.create<ConstantIndexOp>(loc, 0);
-            builder.setInsertionPointToStart(&op.getRegion().front());
-            Value zero = std_constant_index(0);
-            Value one = std_constant_index(1);
-            op.getInductionVar().replaceAllUsesWith(zero);
-            // llvm::outs()<< *parent << "\n";
-            auto counter = 0;
-            builder.setInsertionPoint(op);
-            BlockAndValueMapping map;
-            for (auto &sub_op : op.getRegion().front().without_terminator()){
-                auto cl = builder.clone(sub_op, map);
-                if (sub_op.getNumResults() >= 1 ){
-                     map.map(sub_op.getResults(), cl->getResults());
+                // if condition not met, go into its region
+                bool const_lw_bound = op.hasConstantLowerBound();
+                bool const_up_bound = op.hasConstantUpperBound();
+                bool const_bound = op.hasConstantLowerBound() && op.hasConstantUpperBound();
+                AffineBound lb = op.getLowerBound();
+                AffineBound ub = op.getUpperBound();
+                int64_t lb_value;
+                int64_t ub_value;
+                bool has_lb_v = false;
+                bool has_up_v = false;
+
+                if (const_up_bound){
+                      ub_value = op.getConstantUpperBound();
+                }else{
+                  auto operand = ub.getOperand(0);
+                  auto def_op = operand.getDefiningOp();
+                  if (def_op != nullptr && isa<mlir::ConstantIndexOp>(def_op)){
+                      auto value_attr = def_op->getAttr("value");
+                      auto map = ub.getMap();
+                      SmallVector<Attribute, 1> result;
+                      map.constantFold({value_attr}, result);
+                      auto res = result[0].cast<IntegerAttr>().getInt();
+                      llvm::outs() << res << "\n";
+                      ub_value = res;
+                  }else{
+                    llvm::outs() << "continued at upper bound" << "\n";
+                    operation = walkRegions(operation->getRegions());
+                    continue;
+                  }
                 }
-                counter ++;
+
+                if (const_lw_bound){
+                    lb_value = op.getConstantLowerBound();
+                }else{
+                    auto operand = lb.getOperand(0);
+                    auto def_op = operand.getDefiningOp();
+                    if (def_op != nullptr && isa<mlir::ConstantIndexOp>(def_op)){
+                        auto value_attr = def_op->getAttr("value");
+                        auto map = lb.getMap();
+                        SmallVector<Attribute, 1> result;
+                        map.constantFold({value_attr}, result);
+                        auto res = result[0].cast<IntegerAttr>().getInt();
+                        lb_value = res;
+                        llvm::outs() << res << "\n";
+                  }else{
+                      llvm::outs() << "continued at lb bound" << "\n";
+                    operation = walkRegions(operation->getRegions());
+                    continue;
+                  }
+                }
+
+               
+                if (ub_value - lb_value > op.getStep()){
+                    // llvm::outs() << "hello" << "\n";
+                    llvm::outs() << "condition not meet, continue" << "\n";
+                    operation = walkRegions(operation->getRegions());
+                    continue;
+                }   
+              
+                llvm::outs() << "can be removed" << "\n";
+
+                auto parent = op.getParentOp();
+                // auto blk = parent->getRegion(0).front();
+                ScopedContext scope(builder, parent->getLoc());
+                auto loc = op.getLoc();
+                // Value zero = builder.create<ConstantIndexOp>(loc, 0);
+                builder.setInsertionPointToStart(&op.getRegion().front());
+                Value lb_index = std_constant_index(lb_value);
+                op.getInductionVar().replaceAllUsesWith(lb_index);
+                auto counter = 0;
+                builder.setInsertionPoint(op);
+                BlockAndValueMapping map;
+                for (auto &sub_op : op.getRegion().front().without_terminator()){
+                    auto cl = builder.clone(sub_op, map);
+                    if (sub_op.getNumResults() >= 1 ){
+                        map.map(sub_op.getResults(), cl->getResults());
+                    }
+                    counter ++;
+                }
+                // op.getRegion().cloneInto()
+                regions = parent->getRegions();
+                op.erase();
+                operation = walkRegions(regions);          
             }
-            // op.getRegion().cloneInto()
-            regions = parent->getRegions();
-            op.erase();
-            operation = walkRegions(regions);
-            llvm::outs()<< *parent << "\n";           
-            }
-            // for (int i = 0; i < affineFors.size(); i++)
-            // {
-            //     // affineFors[i]->getConstantLowerBound();
-            //     // llvm::outs()<< affineFors[i].out << "\n";
-            //      affineFors[i].getParent
-            // }
         }
         
         // auto f = getFunction();
